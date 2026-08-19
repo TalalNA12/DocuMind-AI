@@ -1,0 +1,26 @@
+# Python & Virtual Environments
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Environment Variables & Secrets
+.env
+.env.local
+.env.*.local
+
+# Local Uploads & Static Cache
+uploads/
+*.pdf
+
+# Node & Next.js Build Artifacts
+node_modules/
+frontend/.next/
+frontend/out/
+frontend/build/
+.DS_Store
+
+# Logs
+*.log
+celerybeat-schedule
