@@ -1,5 +1,6 @@
 import os
 import re
+import logging
 from typing import List, Dict, Any
 from google import genai
 from google.genai import types
@@ -8,7 +9,15 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from supabase import create_client, Client
 from dotenv import load_dotenv
 
-# 1. Environment & Global Client Configurations
+# Optional LangSmith tracing integration
+try:
+    from langsmith import traceable
+except ImportError:
+    def traceable(*args, **kwargs):
+        def decorator(func):
+            return func
+        return decorator
+
 load_dotenv()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -18,9 +27,11 @@ SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 if not all([GEMINI_API_KEY, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY]):
     raise EnvironmentError("Missing critical environment variables for Ingestion service.")
 
-# Initialize Google GenAI & Supabase Clients
 genai_client = genai.Client(api_key=GEMINI_API_KEY)
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+
+logger = logging.getLogger("documind.ingest")
+logger.setLevel(logging.INFO)
 
 
 def extract_text_from_pdf(file_path: str) -> str:
@@ -36,7 +47,6 @@ def extract_text_from_pdf(file_path: str) -> str:
         if not raw_page_text:
             continue
         
-        # Clean null bytes and collapse whitespace
         cleaned_text = re.sub(r"\x00", "", raw_page_text)
         cleaned_text = re.sub(r"[ \t]+", " ", cleaned_text).strip()
 
@@ -57,11 +67,9 @@ def chunk_text(text: str) -> List[str]:
     return splitter.split_text(text)
 
 
+@traceable(name="gemini_embed_chunks", run_type="embedding")
 def generate_gemini_embeddings(chunks: List[str], batch_size: int = 16) -> List[List[float]]:
-    """
-    Generates 768-dimensional embeddings using gemini-embedding-001.
-    Sets task_type to RETRIEVAL_DOCUMENT for asymmetrical target indexing.
-    """
+    """Generates 768-dimensional embeddings using gemini-embedding-001."""
     all_embeddings: List[List[float]] = []
 
     for i in range(0, len(chunks), batch_size):
@@ -82,44 +90,47 @@ def generate_gemini_embeddings(chunks: List[str], batch_size: int = 16) -> List[
     return all_embeddings
 
 
+@traceable(name="documind_ingest_pipeline", run_type="chain")
 def process_and_store_document(doc_id: str, file_path: str):
     """Parses, chunks, embeds, and batch-inserts the document into Supabase."""
     try:
-        print(f"[*] Starting ingestion for Document ID: {doc_id}")
+        logger.info(f"[*] Starting ingestion for Document ID: {doc_id}")
         
-        # 1. Text extraction
         raw_text = extract_text_from_pdf(file_path)
         if not raw_text.strip():
             raise ValueError("PDF contains no machine-readable text.")
 
-        # 2. Semantic chunking
         chunks = chunk_text(raw_text)
-        print(f"[*] Created {len(chunks)} text chunks.")
+        logger.info(f"[*] Created {len(chunks)} text chunks.")
 
-        # 3. Vector embedding generation
         embeddings = generate_gemini_embeddings(chunks)
-        print(f"[*] Generated {len(embeddings)} 768-dim embeddings via Gemini.")
+        logger.info(f"[*] Generated {len(embeddings)} 768-dim embeddings via Gemini.")
 
-        # 4. Construct SQL records payload
         records: List[Dict[str, Any]] = [
             {
                 "document_id": doc_id,
                 "content": chunk,
                 "chunk_index": idx,
-                "embedding": emb
+                "embedding": emb,
+                "metadata": {
+                    "char_count": len(chunk),
+                    "chunk_index": idx
+                }
             }
             for idx, (chunk, emb) in enumerate(zip(chunks, embeddings))
         ]
 
-        # 5. Batch insert into Supabase pgvector
-        supabase.table("document_chunks").insert(records).execute()
-        print(f"[*] Inserted {len(records)} chunk records into Supabase.")
+        db_batch_size = 50
+        for i in range(0, len(records), db_batch_size):
+            batch_slice = records[i : i + db_batch_size]
+            supabase.table("document_chunks").insert(batch_slice).execute()
 
-        # 6. Mark status as COMPLETED
+        logger.info(f"[*] Successfully inserted {len(records)} chunk records into Supabase.")
+
         supabase.table("documents").update({"status": "COMPLETED"}).eq("id", doc_id).execute()
-        print(f"[SUCCESS] Document {doc_id} indexed in pgvector successfully.")
+        logger.info(f"[SUCCESS] Document {doc_id} indexed in pgvector successfully.")
 
     except Exception as e:
-        print(f"[ERROR] Pipeline execution failed for Doc ID {doc_id}: {str(e)}")
+        logger.error(f"[ERROR] Pipeline execution failed for Doc ID {doc_id}: {str(e)}")
         supabase.table("documents").update({"status": "FAILED"}).eq("id", doc_id).execute()
         raise e

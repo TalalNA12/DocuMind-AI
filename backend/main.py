@@ -4,18 +4,24 @@ import uuid
 from typing import List, Optional
 from fastapi import FastAPI, UploadFile, File, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 # Internal Service Imports
 from services.ingest import supabase
 from services.tasks import process_document_task
-from services.rag import answer_question
+from services.rag import (
+    answer_question,
+    stream_answer_question,
+    generate_document_summary,
+    DocumentSummary
+)
 
 # 1. App Initialization & Metadata
 app = FastAPI(
-    title="DocuMind AI",
-    description="Production-grade asynchronous RAG engine powered by pgvector, Celery, and Gemini.",
-    version="1.0.0"
+    title="DocuMind AI v2",
+    description="Enterprise RAG engine powered by Hybrid Search, Gemini 2.5 Flash, and Celery.",
+    version="2.0.0"
 )
 
 # 2. CORS Middleware Configuration
@@ -41,6 +47,7 @@ class Citation(BaseModel):
     source_id: int
     chunk_id: str
     similarity: float
+    rrf_score: Optional[float] = 0.0
     preview: str
 
 class ChatResponse(BaseModel):
@@ -65,8 +72,7 @@ class StatusResponse(BaseModel):
 
 @app.get("/health", tags=["System"])
 def health_check():
-    """Returns engine health status."""
-    return {"status": "HEALTHY", "engine": "DocuMind AI"}
+    return {"status": "HEALTHY", "engine": "DocuMind AI v2"}
 
 
 @app.post(
@@ -76,10 +82,6 @@ def health_check():
     tags=["Documents"]
 )
 async def upload_document(file: UploadFile = File(...)):
-    """
-    Accepts a PDF file upload, stores it locally, writes a 'PROCESSING' record
-    to Supabase, and dispatches the ingestion pipeline to Celery.
-    """
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -91,25 +93,22 @@ async def upload_document(file: UploadFile = File(...)):
     file_path = os.path.join(UPLOAD_DIR, safe_filename)
 
     try:
-        # Stream file to disk
         with open(file_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
 
-        # Register document state in Supabase
         supabase.table("documents").insert({
             "id": doc_id,
             "filename": file.filename,
             "status": "PROCESSING"
         }).execute()
 
-        # Dispatch async task to Redis / Celery
         process_document_task.delay(doc_id=doc_id, file_path=file_path)
 
         return UploadResponse(
             document_id=doc_id,
             filename=file.filename,
             status="PROCESSING",
-            message="Document received and queued for asynchronous vector ingestion."
+            message="Document received and queued for asynchronous hybrid vector ingestion."
         )
 
     except Exception as e:
@@ -127,12 +126,7 @@ async def upload_document(file: UploadFile = File(...)):
     tags=["Documents"]
 )
 async def get_document_status(doc_id: str):
-    """
-    Retrieves the current indexing state ('PROCESSING', 'COMPLETED', 'FAILED')
-    for a given document ID.
-    """
     response = supabase.table("documents").select("*").eq("id", doc_id).execute()
-    
     if not response.data:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -148,37 +142,66 @@ async def get_document_status(doc_id: str):
     )
 
 
+def _validate_doc_ready(doc_id: str):
+    doc_res = supabase.table("documents").select("status").eq("id", doc_id).execute()
+    if not doc_res.data:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Document '{doc_id}' not found.")
+    doc_status = doc_res.data[0]["status"]
+    if doc_status != "COMPLETED":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Document status is '{doc_status}'. Queries require 'COMPLETED'."
+        )
+
+
 @app.post(
     "/api/v1/chat",
     response_model=ChatResponse,
     tags=["RAG Inference"]
 )
 async def chat_with_document(request: ChatRequest):
-    """
-    Performs vector similarity search and cited LLM synthesis
-    against a fully ingested document.
-    """
-    # Verify document existence and state
-    doc_res = supabase.table("documents").select("status").eq("id", request.document_id).execute()
-    if not doc_res.data:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Document with ID '{request.document_id}' not found."
-        )
-
-    doc_status = doc_res.data[0]["status"]
-    if doc_status != "COMPLETED":
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Document is currently in '{doc_status}' state. Queries require 'COMPLETED' status."
-        )
-
-    # Execute RAG pipeline with graceful upstream exception handling
+    """Synchronous inference endpoint (v1 backward compatibility)."""
+    _validate_doc_ready(request.document_id)
     try:
-        result = answer_question(doc_id=request.document_id, query=request.question)
-        return result
+        return answer_question(doc_id=request.document_id, query=request.question)
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"Inference provider temporarily unavailable: {str(e)}"
+            detail=f"Inference error: {str(e)}"
+        )
+
+
+@app.post(
+    "/api/v1/chat/stream",
+    tags=["RAG Inference"]
+)
+async def chat_with_document_stream(request: ChatRequest):
+    """
+    Server-Sent Events (SSE) streaming endpoint.
+    Emits real-time tokens, citation metadata, and termination signal.
+    """
+    _validate_doc_ready(request.document_id)
+    return StreamingResponse(
+        stream_answer_question(doc_id=request.document_id, query=request.question),
+        media_type="text/event-stream"
+    )
+
+
+@app.get(
+    "/api/v1/documents/{doc_id}/summarize",
+    response_model=DocumentSummary,
+    tags=["Agent Intelligence"]
+)
+async def summarize_document(doc_id: str):
+    """
+    Extracts structured executive summary with key takeaways and risk flags
+    guaranteed by Pydantic response schema.
+    """
+    _validate_doc_ready(doc_id)
+    try:
+        return generate_document_summary(doc_id=doc_id)
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to generate structured summary: {str(e)}"
         )
