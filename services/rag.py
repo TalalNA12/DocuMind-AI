@@ -29,9 +29,14 @@ if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 genai_client = genai.Client(api_key=GEMINI_API_KEY)
 
-# --- Constants ---
+# --- Constants & Fallbacks ---
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "gemini-embedding-001")
-GENERATION_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
+PRIMARY_GENERATION_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
+FALLBACK_GENERATION_MODELS = [
+    PRIMARY_GENERATION_MODEL,
+    "gemini-3-flash",
+    "gemini-2.5-flash"
+]
 CONFIDENCE_THRESHOLD = 0.50
 DEFAULT_MATCH_COUNT = 4
 
@@ -48,12 +53,11 @@ SYSTEM_INSTRUCTION = (
 async def generate_query_embedding_async(text: str, max_retries: int = 3) -> List[float]:
     """
     Asynchronously generates a 768-dimensional embedding vector.
-    Uses genai_client.aio to prevent HTTP socket deadlocks on Railway.
+    Uses genai_client.aio to avoid synchronous socket contention.
     """
     last_exception = None
     for attempt in range(max_retries):
         try:
-            # Using the native asynchronous SDK interface
             response = await genai_client.aio.models.embed_content(
                 model=EMBEDDING_MODEL,
                 contents=text,
@@ -67,10 +71,10 @@ async def generate_query_embedding_async(text: str, max_retries: int = 3) -> Lis
             last_exception = e
             logger.warning(f"Async embedding attempt {attempt + 1}/{max_retries} failed: {e}")
             if attempt < max_retries - 1:
-                import asyncio
                 await asyncio.sleep(1.0)
 
     raise RuntimeError(f"Embedding service timed out: {last_exception}")
+
 
 def retrieve_relevant_chunks(
     doc_id: str, 
@@ -82,7 +86,7 @@ def retrieve_relevant_chunks(
     """
     try:
         rpc_params = {
-            "filter_document_id": doc_id,  # <-- Change "document_id" to "filter_document_id"
+            "filter_document_id": doc_id,
             "query_embedding": query_vector,
             "match_count": match_count
         }
@@ -94,20 +98,11 @@ def retrieve_relevant_chunks(
 
 async def answer_question(doc_id: str, query: str) -> Dict[str, Any]:
     """
-    Standard synchronous RAG pipeline execution.
+    Synchronous fallback endpoint using async query vector generation.
     Returns: { 'answer': str, 'confidence_score': float, 'citations': list }
     """
-    # 1. Embed query asynchronously
-    try:
-        loop = asyncio.get_event_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+    query_vector = await generate_query_embedding_async(query)
 
-    query_vector = loop.run_until_complete(generate_query_embedding_async(query))
-    ...
-
-    # 2. Retrieve top-k chunks
     chunks = retrieve_relevant_chunks(doc_id, query_vector, match_count=DEFAULT_MATCH_COUNT)
 
     if not chunks:
@@ -119,7 +114,6 @@ async def answer_question(doc_id: str, query: str) -> Dict[str, Any]:
 
     top_score = float(chunks[0].get("similarity", 0.0))
 
-    # 3. Guardrail: Confidence Floor
     if top_score < CONFIDENCE_THRESHOLD:
         return {
             "answer": "I could not find sufficient information in the document to reliably answer this question.",
@@ -127,7 +121,6 @@ async def answer_question(doc_id: str, query: str) -> Dict[str, Any]:
             "citations": []
         }
 
-    # 4. Format Context and Source Citations
     context_blocks = []
     citations = []
     for idx, c in enumerate(chunks):
@@ -144,23 +137,26 @@ async def answer_question(doc_id: str, query: str) -> Dict[str, Any]:
     context_str = "\n\n".join(context_blocks)
     prompt = f"### CONTEXT FROM DOCUMENT:\n{context_str}\n\n### USER QUESTION:\n{query}"
 
-    # 5. Synthesis
-    try:
-        response = genai_client.models.generate_content(
-            model=GENERATION_MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                system_instruction=SYSTEM_INSTRUCTION,
-                temperature=0.2
+    for model_id in FALLBACK_GENERATION_MODELS:
+        try:
+            response = genai_client.models.generate_content(
+                model=model_id,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    system_instruction=SYSTEM_INSTRUCTION,
+                    temperature=0.2
+                )
             )
-        )
-        return {
-            "answer": response.text.strip() if response.text else "No response generated.",
-            "confidence_score": round(top_score, 4),
-            "citations": citations
-        }
-    except Exception as e:
-        raise RuntimeError(f"Synthesis failed in Gemini generation: {e}") from e
+            return {
+                "answer": response.text.strip() if response.text else "No response generated.",
+                "confidence_score": round(top_score, 4),
+                "citations": citations
+            }
+        except Exception as e:
+            logger.warning(f"Synthesis failed on model {model_id}: {e}. Retrying fallback...")
+            continue
+
+    raise RuntimeError("Inference generation failed across all available Gemini model endpoints.")
 
 
 async def stream_answer_question(doc_id: str, query: str) -> AsyncGenerator[str, None]:
@@ -168,14 +164,12 @@ async def stream_answer_question(doc_id: str, query: str) -> AsyncGenerator[str,
     Asynchronous SSE streaming generator for real-time frontend token delivery.
     Yields data lines formatted as: data: {"type": ..., ...}\n\n
     """
-    # 1. Embed query
     try:
         query_vector = await generate_query_embedding_async(query)
     except Exception as e:
         yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
         return
 
-    # 2. Retrieve chunks
     try:
         chunks = retrieve_relevant_chunks(doc_id, query_vector, match_count=DEFAULT_MATCH_COUNT)
     except Exception as e:
@@ -195,7 +189,6 @@ async def stream_answer_question(doc_id: str, query: str) -> AsyncGenerator[str,
 
     top_score = float(chunks[0].get("similarity", 0.0))
 
-    # 3. Confidence Threshold Check
     if top_score < CONFIDENCE_THRESHOLD:
         payload = {
             "type": "terminal",
@@ -207,7 +200,6 @@ async def stream_answer_question(doc_id: str, query: str) -> AsyncGenerator[str,
         yield f"data: {json.dumps(payload)}\n\n"
         return
 
-    # 4. Prepare Context and Metadata
     context_blocks = []
     citations = []
     for idx, c in enumerate(chunks):
@@ -224,7 +216,7 @@ async def stream_answer_question(doc_id: str, query: str) -> AsyncGenerator[str,
     context_str = "\n\n".join(context_blocks)
     prompt = f"### CONTEXT FROM DOCUMENT:\n{context_str}\n\n### USER QUESTION:\n{query}"
 
-    # 5. Emit Initial Metadata Frame (Citations & Score)
+    # Emit metadata first
     meta_frame = {
         "type": "meta",
         "confidence_score": round(top_score, 4),
@@ -232,25 +224,32 @@ async def stream_answer_question(doc_id: str, query: str) -> AsyncGenerator[str,
     }
     yield f"data: {json.dumps(meta_frame)}\n\n"
 
-    # 6. Stream Generation Tokens
-    try:
-        response_stream = genai_client.models.generate_content_stream(
-            model=GENERATION_MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                system_instruction=SYSTEM_INSTRUCTION,
-                temperature=0.2
+    # Stream tokens with model fallback cascade
+    stream_successful = False
+    for model_id in FALLBACK_GENERATION_MODELS:
+        try:
+            response_stream = genai_client.models.generate_content_stream(
+                model=model_id,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    system_instruction=SYSTEM_INSTRUCTION,
+                    temperature=0.2
+                )
             )
-        )
-        for chunk in response_stream:
-            if chunk.text:
-                token_frame = {"type": "token", "token": chunk.text}
-                yield f"data: {json.dumps(token_frame)}\n\n"
+            for chunk in response_stream:
+                if chunk.text:
+                    token_frame = {"type": "token", "token": chunk.text}
+                    yield f"data: {json.dumps(token_frame)}\n\n"
 
-        yield f"data: {json.dumps({'type': 'done', 'done': True})}\n\n"
+            yield f"data: {json.dumps({'type': 'done', 'done': True})}\n\n"
+            stream_successful = True
+            break
+        except Exception as e:
+            logger.warning(f"Stream generation dropped on {model_id}: {e}. Trying fallback model...")
+            continue
 
-    except Exception as e:
-        yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
+    if not stream_successful:
+        yield f"data: {json.dumps({'type': 'error', 'error': 'Inference capacity exhausted across models. Please retry shortly.'})}\n\n"
 
 
 class DocumentSummary(BaseModel):
@@ -259,10 +258,6 @@ class DocumentSummary(BaseModel):
     key_takeaways: List[str] = Field(default_factory=list, description="Extracted bullet points or key takeaways")
 
 def generate_document_summary(doc_id: str) -> Dict[str, Any]:
-    """
-    Retrieves the initial chunks of the document and generates
-    an executive summary and key takeaways.
-    """
     try:
         response = (
             supabase.table("document_chunks")
@@ -289,17 +284,22 @@ def generate_document_summary(doc_id: str) -> Dict[str, Any]:
             f"### DOCUMENT CONTENT:\n{context}"
         )
 
-        res = genai_client.models.generate_content(
-            model=GENERATION_MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                system_instruction="You are an elite technical document analyst. Summarize clearly and objectively.",
-                temperature=0.2
-            )
-        )
+        res = None
+        for model_id in FALLBACK_GENERATION_MODELS:
+            try:
+                res = genai_client.models.generate_content(
+                    model=model_id,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        system_instruction="You are an elite technical document analyst. Summarize clearly and objectively.",
+                        temperature=0.2
+                    )
+                )
+                break
+            except Exception:
+                continue
 
-        raw_text = res.text.strip() if res.text else ""
-
+        raw_text = res.text.strip() if (res and res.text) else ""
         lines = [line.strip() for line in raw_text.split("\n") if line.strip()]
         takeaways = [l.lstrip("*-•123456789. ") for l in lines if l.startswith(("*", "-", "•")) or (len(l) > 2 and l[0].isdigit() and l[1] in ". ")]
 

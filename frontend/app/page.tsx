@@ -446,9 +446,6 @@ export default function DocuMindDashboard() {
             <span>Active Target:</span>
             <span className="text-slate-200 font-semibold">{docState.filename || "No Document Ingested"}</span>
           </div>
-          <span className="text-[10px] font-mono px-2.5 py-1 rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
-            gemini-3.6-flash
-          </span>
         </div>
 
         {/* Messages Stream */}
