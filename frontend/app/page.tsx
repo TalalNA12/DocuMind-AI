@@ -64,6 +64,7 @@ export default function DocuMindDashboard() {
 
   const [inputQuery, setInputQuery] = useState("");
   const [isInferring, setIsInferring] = useState(false);
+  const [inferStage, setInferStage] = useState<string>("Analyzing prompt...");
   const [isDragging, setIsDragging] = useState(false);
   const [activeCitation, setActiveCitation] = useState<Citation | null>(null);
 
@@ -90,7 +91,7 @@ export default function DocuMindDashboard() {
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages, isInferring]);
+  }, [messages, isInferring, inferStage]);
 
   // Polling Hook for Ingestion Lifecycle
   useEffect(() => {
@@ -168,6 +169,7 @@ export default function DocuMindDashboard() {
     setMessages((prev) => [...prev, userMessage]);
     setInputQuery("");
     setIsInferring(true);
+    setInferStage("Generating query embeddings...");
 
     const botMessageId = `bot-${Date.now()}`;
     const botPlaceholder: Message = {
@@ -180,7 +182,7 @@ export default function DocuMindDashboard() {
     setMessages((prev) => [...prev, botPlaceholder]);
 
     try {
-      // 1. Try real-time SSE Streaming
+      // 1. SSE Streaming Request
       const response = await fetch(`${API_BASE}/api/v1/chat/stream`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -216,6 +218,7 @@ export default function DocuMindDashboard() {
               const payload = JSON.parse(rawData);
 
               if (payload.type === "meta") {
+                setInferStage("Scanning HNSW index & evaluating chunks...");
                 if (payload.citations && payload.citations.length > 0) {
                   setActiveCitation(payload.citations[0]);
                 }
@@ -231,6 +234,7 @@ export default function DocuMindDashboard() {
                   )
                 );
               } else if (payload.type === "token") {
+                setInferStage(""); // Clear phase text once stream delivery starts
                 accumulatedContent += payload.token;
                 setMessages((prev) =>
                   prev.map((msg) =>
@@ -240,6 +244,7 @@ export default function DocuMindDashboard() {
                   )
                 );
               } else if (payload.type === "terminal") {
+                setInferStage("");
                 accumulatedContent = payload.answer;
                 setMessages((prev) =>
                   prev.map((msg) =>
@@ -254,6 +259,7 @@ export default function DocuMindDashboard() {
                   )
                 );
               } else if (payload.type === "error") {
+                setInferStage("");
                 setMessages((prev) =>
                   prev.map((msg) =>
                     msg.id === botMessageId
@@ -272,8 +278,9 @@ export default function DocuMindDashboard() {
         }
       }
     } catch (streamErr: any) {
-      // 2. Fallback to synchronous chat endpoint if streaming encounters issues
+      // 2. Synchronous fallback
       try {
+        setInferStage("Falling back to synchronous endpoint...");
         const fallbackRes = await fetch(`${API_BASE}/api/v1/chat`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -316,6 +323,7 @@ export default function DocuMindDashboard() {
       }
     } finally {
       setIsInferring(false);
+      setInferStage("");
     }
   };
 
@@ -464,10 +472,18 @@ export default function DocuMindDashboard() {
                       : "bg-[#0E1322] border border-slate-800/80 text-slate-200 rounded-bl-none shadow-lg"
                   }`}
                 >
-                  <ReactMarkdown>{msg.content}</ReactMarkdown>
+                  {/* Dynamic Loading State: Shows step-by-step telemetry while waiting for first tokens */}
+                  {msg.sender === "assistant" && !msg.content ? (
+                    <div className="flex items-center gap-2.5 py-1 text-slate-400 font-mono text-[11px]">
+                      <Loader2 className="w-3.5 h-3.5 animate-spin text-emerald-400" />
+                      <span className="animate-pulse">{inferStage || "Synthesizing answer..."}</span>
+                    </div>
+                  ) : (
+                    <ReactMarkdown>{msg.content}</ReactMarkdown>
+                  )}
 
-                  {/* Inline Citation Badges */}
-                  {msg.citations && msg.citations.length > 0 && (
+                  {/* Inline Citation Badges: Rendered strictly AFTER tokens exist */}
+                  {msg.content && msg.citations && msg.citations.length > 0 && (
                     <div className="mt-3 pt-3 border-t border-slate-800/60 flex flex-wrap gap-2 items-center">
                       <span className="text-[10px] font-mono text-slate-500 uppercase tracking-wider">Citations:</span>
                       {msg.citations.map((c) => (
@@ -491,17 +507,6 @@ export default function DocuMindDashboard() {
               </div>
             </div>
           ))}
-
-          {isInferring && !messages.some((m) => m.sender === "assistant" && m.content) && (
-            <div className="flex gap-3.5 max-w-2xl">
-              <div className="w-7 h-7 rounded-lg bg-emerald-500/10 border border-emerald-500/30 flex items-center justify-center text-emerald-400 shrink-0 animate-pulse">
-                <Loader2 className="w-3.5 h-3.5 animate-spin" />
-              </div>
-              <div className="p-3.5 rounded-2xl bg-[#0E1322] border border-slate-800 text-xs text-slate-400 italic">
-                Executing cosine distance search across HNSW index...
-              </div>
-            </div>
-          )}
 
           <div ref={messagesEndRef} />
         </div>
