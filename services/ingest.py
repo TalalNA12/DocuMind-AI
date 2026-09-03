@@ -3,9 +3,10 @@ import io
 import re
 import logging
 from typing import List, Dict, Any
+import pypdf
+from pypdf import PdfReader
 from google import genai
 from google.genai import types
-from pypdf import PdfReader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from supabase import create_client, Client
 from dotenv import load_dotenv
@@ -35,12 +36,9 @@ logger = logging.getLogger("documind.ingest")
 logger.setLevel(logging.INFO)
 
 
-def extract_text_from_pdf(file_path: str) -> str:
-    """Reads a local PDF file and extracts clean text with page boundary markers."""
-    if not os.path.exists(file_path):
-        raise FileNotFoundError(f"PDF file not found at path: {file_path}")
-
-    reader = PdfReader(file_path)
+def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
+    """Reads PDF bytes directly from memory and extracts cleaned text with page markers."""
+    reader = PdfReader(io.BytesIO(pdf_bytes))
     extracted_pages = []
 
     for page_idx, page in enumerate(reader.pages):
@@ -104,33 +102,36 @@ def process_and_store_document(doc_id: str, file_path: str):
             pdf_bytes = supabase.storage.from_("documents").download(file_path)
 
         # 2. Extract text from memory
-        reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
-        full_text = ""
-        for page in reader.pages:
-            text = page.extract_text()
-            if text:
-                full_text += text + "\n"
+        full_text = extract_text_from_pdf_bytes(pdf_bytes)
 
         if not full_text.strip():
             raise ValueError("No extractable text found in PDF.")
 
-        # 3. Chunking logic (keep your existing chunking implementation)
-        chunks = chunk_text(full_text) # or whatever your chunking function is named
+        # 3. Split into overlapping chunks
+        chunks = chunk_text(full_text)
+        if not chunks:
+            raise ValueError("Text chunking resulted in 0 chunks.")
 
-        # 4. Embed & Store in document_chunks
-        for idx, chunk in enumerate(chunks):
-            # Your existing embedding generation and insertion logic:
-            embedding = generate_embedding(chunk)
-            supabase.table("document_chunks").insert({
+        # 4. Generate batch embeddings
+        embeddings = generate_gemini_embeddings(chunks)
+
+        # 5. Insert records into document_chunks
+        records = [
+            {
                 "document_id": doc_id,
                 "chunk_index": idx,
                 "content": chunk,
-                "embedding": embedding
-            }).execute()
+                "embedding": emb
+            }
+            for idx, (chunk, emb) in enumerate(zip(chunks, embeddings))
+        ]
 
-        # 5. Mark document as COMPLETED
+        # Batch insert to Supabase
+        supabase.table("document_chunks").insert(records).execute()
+
+        # 6. Update document state to COMPLETED
         supabase.table("documents").update({"status": "COMPLETED"}).eq("id", doc_id).execute()
-        print(f"[+] Document {doc_id} successfully indexed.")
+        print(f"[+] Document {doc_id} successfully indexed ({len(chunks)} chunks).")
         return {"chunks_indexed": len(chunks)}
 
     except Exception as e:
