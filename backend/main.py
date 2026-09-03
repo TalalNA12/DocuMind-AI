@@ -169,7 +169,7 @@ async def chat_with_document(request: ChatRequest):
     """Synchronous inference endpoint (v1 backward compatibility)."""
     _validate_doc_ready(request.document_id)
     try:
-        return answer_question(doc_id=request.document_id, query=request.question)
+        return await answer_question(doc_id=request.document_id, query=request.question)
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
