@@ -82,7 +82,7 @@ def retrieve_relevant_chunks(
     """
     try:
         rpc_params = {
-            "document_id": doc_id,
+            "filter_document_id": doc_id,  # <-- Change "document_id" to "filter_document_id"
             "query_embedding": query_vector,
             "match_count": match_count
         }
