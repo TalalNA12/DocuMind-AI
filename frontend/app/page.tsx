@@ -13,8 +13,7 @@ import {
   CheckCircle2,
   AlertCircle,
   Database,
-  Layers,
-  ChevronRight
+  Layers
 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 
@@ -40,9 +39,13 @@ interface DocumentState {
   status: "IDLE" | "UPLOADING" | "PROCESSING" | "COMPLETED" | "FAILED";
 }
 
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000";
+const API_BASE = 
+  process.env.NEXT_PUBLIC_API_URL || 
+  process.env.NEXT_PUBLIC_API_BASE_URL || 
+  "http://localhost:8000";
 
 export default function DocuMindDashboard() {
+  const [hasMounted, setHasMounted] = useState(false);
   const [docState, setDocState] = useState<DocumentState>({
     id: "",
     filename: "",
@@ -53,11 +56,12 @@ export default function DocuMindDashboard() {
     {
       id: "welcome",
       sender: "assistant",
-      content: "Welcome to **DocuMind AI**. Upload a PDF document on the left panel. Documents are indexed asynchronously with Celery, mapped to 768-dim embeddings, and grounded via Supabase pgvector.",
-      timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+      content:
+        "Welcome to **DocuMind AI**. Upload a PDF document on the left panel. Documents are indexed asynchronously with Celery, mapped to 768-dim embeddings, and grounded via Supabase pgvector.",
+      timestamp: "", 
     },
   ]);
-  
+
   const [inputQuery, setInputQuery] = useState("");
   const [isInferring, setIsInferring] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
@@ -65,6 +69,24 @@ export default function DocuMindDashboard() {
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
+
+  // Eliminate Hydration Mismatches by stamping initial times strictly on client mount
+  useEffect(() => {
+    setHasMounted(true);
+    setMessages((prev) =>
+      prev.map((msg) =>
+        msg.id === "welcome"
+          ? {
+              ...msg,
+              timestamp: new Date().toLocaleTimeString([], {
+                hour: "2-digit",
+                minute: "2-digit",
+              }),
+            }
+          : msg
+      )
+    );
+  }, []);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -82,7 +104,7 @@ export default function DocuMindDashboard() {
             if (data.status === "COMPLETED") {
               setDocState((prev) => ({ ...prev, status: "COMPLETED" }));
               clearInterval(interval);
-            } else if (data.status === "FAILED") {
+            } else if (data.status === "FAILED" || data.status === "ERROR") {
               setDocState((prev) => ({ ...prev, status: "FAILED" }));
               clearInterval(interval);
             }
@@ -90,7 +112,7 @@ export default function DocuMindDashboard() {
         } catch (err) {
           console.error("Polling error:", err);
         }
-      }, 1500);
+      }, 2000);
     }
     return () => clearInterval(interval);
   }, [docState.status, docState.id]);
@@ -112,7 +134,10 @@ export default function DocuMindDashboard() {
         body: formData,
       });
 
-      if (!res.ok) throw new Error("Upload request rejected");
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        throw new Error(errData.detail || "Upload request rejected");
+      }
       const data = await res.json();
 
       setDocState({
@@ -131,19 +156,32 @@ export default function DocuMindDashboard() {
     const query = inputQuery.trim();
     if (!query || docState.status !== "COMPLETED" || isInferring) return;
 
+    const timeString = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+
     const userMessage: Message = {
       id: `usr-${Date.now()}`,
       sender: "user",
       content: query,
-      timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+      timestamp: timeString,
     };
 
     setMessages((prev) => [...prev, userMessage]);
     setInputQuery("");
     setIsInferring(true);
 
+    const botMessageId = `bot-${Date.now()}`;
+    const botPlaceholder: Message = {
+      id: botMessageId,
+      sender: "assistant",
+      content: "",
+      timestamp: timeString,
+    };
+
+    setMessages((prev) => [...prev, botPlaceholder]);
+
     try {
-      const res = await fetch(`${API_BASE}/api/v1/chat`, {
+      // 1. Try real-time SSE Streaming
+      const response = await fetch(`${API_BASE}/api/v1/chat/stream`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -152,32 +190,107 @@ export default function DocuMindDashboard() {
         }),
       });
 
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.detail || "RAG inference failed");
-
-      const botMessage: Message = {
-        id: `bot-${Date.now()}`,
-        sender: "assistant",
-        content: data.answer,
-        confidenceScore: data.confidence_score,
-        citations: data.citations,
-        timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
-      };
-
-      setMessages((prev) => [...prev, botMessage]);
-      if (data.citations && data.citations.length > 0) {
-        setActiveCitation(data.citations[0]);
+      if (!response.ok || !response.body) {
+        throw new Error("Streaming connection failed");
       }
-    } catch (err: any) {
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: `bot-err-${Date.now()}`,
-          sender: "assistant",
-          content: `⚠️ **Inference Error**: ${err.message}`,
-          timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
-        },
-      ]);
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder("utf-8");
+      let streamBuffer = "";
+      let accumulatedContent = "";
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+
+        streamBuffer += decoder.decode(value, { stream: true });
+        const lines = streamBuffer.split("\n\n");
+        streamBuffer = lines.pop() || "";
+
+        for (const line of lines) {
+          if (line.startsWith("data: ")) {
+            const rawData = line.replace("data: ", "").trim();
+            if (!rawData) continue;
+
+            try {
+              const payload = JSON.parse(rawData);
+
+              if (payload.type === "meta") {
+                if (payload.citations && payload.citations.length > 0) {
+                  setActiveCitation(payload.citations[0]);
+                }
+                setMessages((prev) =>
+                  prev.map((msg) =>
+                    msg.id === botMessageId
+                      ? {
+                          ...msg,
+                          confidenceScore: payload.confidence_score,
+                          citations: payload.citations,
+                        }
+                      : msg
+                  )
+                );
+              } else if (payload.type === "token") {
+                accumulatedContent += payload.token;
+                setMessages((prev) =>
+                  prev.map((msg) =>
+                    msg.id === botMessageId
+                      ? { ...msg, content: accumulatedContent }
+                      : msg
+                  )
+                );
+              } else if (payload.type === "error") {
+                throw new Error(payload.error || "Generation error");
+              }
+            } catch (pErr) {
+              console.warn("Unparseable SSE frame:", rawData);
+            }
+          }
+        }
+      }
+    } catch (streamErr: any) {
+      // 2. Fallback to synchronous chat endpoint if streaming encounters issues
+      try {
+        const fallbackRes = await fetch(`${API_BASE}/api/v1/chat`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            document_id: docState.id,
+            question: query,
+          }),
+        });
+
+        const fallbackData = await fallbackRes.json();
+        if (!fallbackRes.ok) throw new Error(fallbackData.detail || "Inference failed");
+
+        setMessages((prev) =>
+          prev.map((msg) =>
+            msg.id === botMessageId
+              ? {
+                  ...msg,
+                  content: fallbackData.answer,
+                  confidenceScore: fallbackData.confidence_score,
+                  citations: fallbackData.citations,
+                }
+              : msg
+          )
+        );
+
+        if (fallbackData.citations && fallbackData.citations.length > 0) {
+          setActiveCitation(fallbackData.citations[0]);
+        }
+      } catch (finalErr: any) {
+        setMessages((prev) =>
+          prev.map((msg) =>
+            msg.id === botMessageId
+              ? {
+                  ...msg,
+                  content: `⚠️ **Inference Error**: ${finalErr.message}`,
+                }
+              : msg
+          )
+        );
+      }
     } finally {
       setIsInferring(false);
     }
@@ -287,7 +400,7 @@ export default function DocuMindDashboard() {
             <span>Anti-Hallucination Guard</span>
           </div>
           <p className="leading-relaxed text-[10px]">
-            Inference requires cosine similarity $\ge 0.50$. Generation locked at $T=0.2$.
+            Inference requires cosine similarity ≥ 0.50. Generation locked at T=0.2.
           </p>
         </div>
       </aside>
@@ -303,7 +416,7 @@ export default function DocuMindDashboard() {
             <span className="text-slate-200 font-semibold">{docState.filename || "No Document Ingested"}</span>
           </div>
           <span className="text-[10px] font-mono px-2.5 py-1 rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
-            gemini-3.6-flash
+            gemini-2.5-flash
           </span>
         </div>
 
@@ -347,12 +460,16 @@ export default function DocuMindDashboard() {
                     </div>
                   )}
                 </div>
-                <span className="text-[9px] font-mono text-slate-600 px-1">{msg.timestamp}</span>
+                {hasMounted && msg.timestamp && (
+                  <span suppressHydrationWarning className="text-[9px] font-mono text-slate-600 px-1">
+                    {msg.timestamp}
+                  </span>
+                )}
               </div>
             </div>
           ))}
 
-          {isInferring && (
+          {isInferring && !messages.some((m) => m.sender === "assistant" && m.content) && (
             <div className="flex gap-3.5 max-w-2xl">
               <div className="w-7 h-7 rounded-lg bg-emerald-500/10 border border-emerald-500/30 flex items-center justify-center text-emerald-400 shrink-0 animate-pulse">
                 <Loader2 className="w-3.5 h-3.5 animate-spin" />

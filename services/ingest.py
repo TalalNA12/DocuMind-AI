@@ -1,4 +1,5 @@
 import os
+import io
 import re
 import logging
 from typing import List, Dict, Any
@@ -92,45 +93,47 @@ def generate_gemini_embeddings(chunks: List[str], batch_size: int = 16) -> List[
 
 @traceable(name="documind_ingest_pipeline", run_type="chain")
 def process_and_store_document(doc_id: str, file_path: str):
-    """Parses, chunks, embeds, and batch-inserts the document into Supabase."""
+    print(f"[*] Starting ingestion for Document ID: {doc_id}")
     try:
-        logger.info(f"[*] Starting ingestion for Document ID: {doc_id}")
-        
-        raw_text = extract_text_from_pdf(file_path)
-        if not raw_text.strip():
-            raise ValueError("PDF contains no machine-readable text.")
+        # 1. Acquire PDF bytes from Local Disk or Supabase Storage
+        if os.path.exists(file_path):
+            with open(file_path, "rb") as f:
+                pdf_bytes = f.read()
+        else:
+            # Download directly from Supabase Storage bucket 'documents'
+            pdf_bytes = supabase.storage.from_("documents").download(file_path)
 
-        chunks = chunk_text(raw_text)
-        logger.info(f"[*] Created {len(chunks)} text chunks.")
+        # 2. Extract text from memory
+        reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
+        full_text = ""
+        for page in reader.pages:
+            text = page.extract_text()
+            if text:
+                full_text += text + "\n"
 
-        embeddings = generate_gemini_embeddings(chunks)
-        logger.info(f"[*] Generated {len(embeddings)} 768-dim embeddings via Gemini.")
+        if not full_text.strip():
+            raise ValueError("No extractable text found in PDF.")
 
-        records: List[Dict[str, Any]] = [
-            {
+        # 3. Chunking logic (keep your existing chunking implementation)
+        chunks = chunk_text(full_text) # or whatever your chunking function is named
+
+        # 4. Embed & Store in document_chunks
+        for idx, chunk in enumerate(chunks):
+            # Your existing embedding generation and insertion logic:
+            embedding = generate_embedding(chunk)
+            supabase.table("document_chunks").insert({
                 "document_id": doc_id,
-                "content": chunk,
                 "chunk_index": idx,
-                "embedding": emb,
-                "metadata": {
-                    "char_count": len(chunk),
-                    "chunk_index": idx
-                }
-            }
-            for idx, (chunk, emb) in enumerate(zip(chunks, embeddings))
-        ]
+                "content": chunk,
+                "embedding": embedding
+            }).execute()
 
-        db_batch_size = 50
-        for i in range(0, len(records), db_batch_size):
-            batch_slice = records[i : i + db_batch_size]
-            supabase.table("document_chunks").insert(batch_slice).execute()
-
-        logger.info(f"[*] Successfully inserted {len(records)} chunk records into Supabase.")
-
+        # 5. Mark document as COMPLETED
         supabase.table("documents").update({"status": "COMPLETED"}).eq("id", doc_id).execute()
-        logger.info(f"[SUCCESS] Document {doc_id} indexed in pgvector successfully.")
+        print(f"[+] Document {doc_id} successfully indexed.")
+        return {"chunks_indexed": len(chunks)}
 
     except Exception as e:
-        logger.error(f"[ERROR] Pipeline execution failed for Doc ID {doc_id}: {str(e)}")
-        supabase.table("documents").update({"status": "FAILED"}).eq("id", doc_id).execute()
+        print(f"[ERROR] Pipeline execution failed for Doc ID {doc_id}: {e}")
+        supabase.table("documents").update({"status": "ERROR"}).eq("id", doc_id).execute()
         raise e

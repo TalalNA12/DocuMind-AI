@@ -89,31 +89,37 @@ async def upload_document(file: UploadFile = File(...)):
         )
 
     doc_id = str(uuid.uuid4())
-    safe_filename = f"{doc_id}_{file.filename}"
-    file_path = os.path.join(UPLOAD_DIR, safe_filename)
+    storage_path = f"{doc_id}_{file.filename}"
 
     try:
-        with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
+        # Read file bytes directly into memory
+        file_bytes = await file.read()
 
+        # Upload directly to Supabase Storage bucket 'documents'
+        supabase.storage.from_("documents").upload(
+            path=storage_path,
+            file=file_bytes,
+            file_options={"content-type": "application/pdf"}
+        )
+
+        # Record in Supabase DB
         supabase.table("documents").insert({
             "id": doc_id,
             "filename": file.filename,
             "status": "PROCESSING"
         }).execute()
 
-        process_document_task.delay(doc_id=doc_id, file_path=file_path)
+        # Enqueue task passing the Supabase Storage path/key
+        process_document_task.delay(doc_id=doc_id, file_path=storage_path)
 
         return UploadResponse(
             document_id=doc_id,
             filename=file.filename,
             status="PROCESSING",
-            message="Document received and queued for asynchronous hybrid vector ingestion."
+            message="Document uploaded and queued for background ingestion."
         )
 
     except Exception as e:
-        if os.path.exists(file_path):
-            os.remove(file_path)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Upload failed: {str(e)}"
