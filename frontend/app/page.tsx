@@ -239,8 +239,31 @@ export default function DocuMindDashboard() {
                       : msg
                   )
                 );
+              } else if (payload.type === "terminal") {
+                accumulatedContent = payload.answer;
+                setMessages((prev) =>
+                  prev.map((msg) =>
+                    msg.id === botMessageId
+                      ? {
+                          ...msg,
+                          content: payload.answer,
+                          confidenceScore: payload.confidence_score,
+                          citations: payload.citations || [],
+                        }
+                      : msg
+                  )
+                );
               } else if (payload.type === "error") {
-                throw new Error(payload.error || "Generation error");
+                setMessages((prev) =>
+                  prev.map((msg) =>
+                    msg.id === botMessageId
+                      ? {
+                          ...msg,
+                          content: `⚠️ **Inference Error**: ${payload.error || "Generation error"}`,
+                        }
+                      : msg
+                  )
+                );
               }
             } catch (pErr) {
               console.warn("Unparseable SSE frame:", rawData);

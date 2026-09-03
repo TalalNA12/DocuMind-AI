@@ -1,5 +1,7 @@
 import os
 import json
+import time
+import logging
 from typing import List, Dict, Any, AsyncGenerator
 from dotenv import load_dotenv
 from supabase import create_client, Client
@@ -8,6 +10,9 @@ from google.genai import types
 from pydantic import BaseModel, Field
 
 load_dotenv()
+
+logger = logging.getLogger("documind.rag")
+logger.setLevel(logging.INFO)
 
 # --- Configuration & Credentials ---
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -23,7 +28,7 @@ if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 genai_client = genai.Client(
     api_key=GEMINI_API_KEY,
-    http_options=types.HttpOptions(timeout=30.0)
+    http_options=types.HttpOptions(timeout=60.0)
 )
 
 # --- Constants ---
@@ -42,22 +47,29 @@ SYSTEM_INSTRUCTION = (
 )
 
 
-def generate_query_embedding(text: str) -> List[float]:
+def generate_query_embedding(text: str, max_retries: int = 3) -> List[float]:
     """
-    Generates a 768-dimensional embedding vector for query retrieval.
+    Generates a 768-dimensional embedding vector for query retrieval with automatic retry on timeout.
     """
-    try:
-        response = genai_client.models.embed_content(
-            model=EMBEDDING_MODEL,
-            contents=text,
-            config=types.EmbedContentConfig(
-                task_type="RETRIEVAL_QUERY",
-                output_dimensionality=768
+    last_exception = None
+    for attempt in range(max_retries):
+        try:
+            response = genai_client.models.embed_content(
+                model=EMBEDDING_MODEL,
+                contents=text,
+                config=types.EmbedContentConfig(
+                    task_type="RETRIEVAL_QUERY",
+                    output_dimensionality=768
+                )
             )
-        )
-        return response.embeddings[0].values
-    except Exception as e:
-        raise RuntimeError(f"Failed to generate query embedding: {e}") from e
+            return response.embeddings[0].values
+        except Exception as e:
+            last_exception = e
+            logger.warning(f"Embedding attempt {attempt + 1}/{max_retries} failed: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(1.0 * (attempt + 1))
+            
+    raise RuntimeError(f"Failed to generate query embedding after {max_retries} attempts: {last_exception}") from last_exception
 
 
 def retrieve_relevant_chunks(
@@ -207,7 +219,7 @@ async def stream_answer_question(doc_id: str, query: str) -> AsyncGenerator[str,
 
     # 5. Emit Initial Metadata Frame (Citations & Score)
     meta_frame = {
-        "type": "metadata",
+        "type": "meta",
         "confidence_score": round(top_score, 4),
         "citations": citations
     }
@@ -225,7 +237,7 @@ async def stream_answer_question(doc_id: str, query: str) -> AsyncGenerator[str,
         )
         for chunk in response_stream:
             if chunk.text:
-                token_frame = {"type": "token", "text": chunk.text}
+                token_frame = {"type": "token", "token": chunk.text}
                 yield f"data: {json.dumps(token_frame)}\n\n"
 
         yield f"data: {json.dumps({'type': 'done', 'done': True})}\n\n"
@@ -281,7 +293,6 @@ def generate_document_summary(doc_id: str) -> Dict[str, Any]:
 
         raw_text = res.text.strip() if res.text else ""
 
-        # Parse out summary vs takeaways if present, or pass cleanly
         lines = [line.strip() for line in raw_text.split("\n") if line.strip()]
         takeaways = [l.lstrip("*-•123456789. ") for l in lines if l.startswith(("*", "-", "•")) or (len(l) > 2 and l[0].isdigit() and l[1] in ". ")]
 
