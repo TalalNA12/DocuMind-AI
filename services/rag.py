@@ -31,7 +31,7 @@ genai_client = genai.Client(api_key=GEMINI_API_KEY)
 
 # --- Constants ---
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "gemini-embedding-001")
-GENERATION_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+GENERATION_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
 CONFIDENCE_THRESHOLD = 0.50
 DEFAULT_MATCH_COUNT = 4
 
